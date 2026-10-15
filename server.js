@@ -18,13 +18,33 @@ const pool = mysql.createPool({
   password: process.env.DB_PASS,
   database: process.env.DB_NAME || 'tangga_pintar',
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: Number(process.env.DB_POOL) || 3,
   charset: 'utf8mb4',
+  ssl: process.env.DB_SSL === 'true' ? { minVersion: 'TLSv1.2', rejectUnauthorized: true } : undefined,
 });
 
 const app = express();
 app.use(express.json({ limit: '50kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Siapkan PIN guru saat permintaan API pertama (cocok untuk serverless seperti Vercel)
+let booting = null;
+function boot() {
+  if (!booting) {
+    booting = (async () => {
+      const [[row]] = await pool.query("SELECT v FROM settings WHERE k = 'pin_hash'");
+      if (!row) {
+        const h = await bcrypt.hash(process.env.TEACHER_PIN || '1234', 10);
+        await pool.query("INSERT INTO settings (k, v) VALUES ('pin_hash', ?)", [h]);
+      }
+    })().catch((e) => { booting = null; throw e; });
+  }
+  return booting;
+}
+app.use('/api', async (req, res, next) => {
+  try { await boot(); next(); }
+  catch (e) { console.error('Database error:', e.message); res.status(500).json({ error: 'Database tidak terhubung' }); }
+});
 
 const GR = ['12', '34', '56'];
 const SUB = ['mtk', 'indo', 'ipa', 'ips', 'ing', 'pkn'];
@@ -153,16 +173,11 @@ app.post('/api/games', wrap(async (req, res) => {
 }));
 
 /* ---------- START ---------- */
-const PORT = process.env.PORT || 3000;
-(async () => {
-  await pool.query('SELECT 1');
-  const [[row]] = await pool.query("SELECT v FROM settings WHERE k = 'pin_hash'");
-  if (!row) {
-    const h = await bcrypt.hash(process.env.TEACHER_PIN || '1234', 10);
-    await pool.query("INSERT INTO settings (k, v) VALUES ('pin_hash', ?)", [h]);
-  }
-  app.listen(PORT, () => console.log('Tangga Pintar berjalan di http://localhost:' + PORT));
-})().catch((e) => {
-  console.error('Gagal terhubung ke MySQL:', e.message);
-  process.exit(1);
-});
+module.exports = app; // dipakai Vercel
+
+if (require.main === module) { // dijalankan langsung: npm start
+  const PORT = process.env.PORT || 3000;
+  boot()
+    .then(() => app.listen(PORT, () => console.log('Tangga Pintar berjalan di http://localhost:' + PORT)))
+    .catch((e) => { console.error('Gagal terhubung ke MySQL:', e.message); process.exit(1); });
+}
